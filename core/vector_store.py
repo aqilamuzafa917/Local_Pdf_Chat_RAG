@@ -11,7 +11,7 @@ Poin Pembelajaran:
 
 import logging
 import numpy as np
-from faiss import IndexFlatL2, IndexIVFFlat, IndexIVFPQ
+from faiss import IndexFlatIP, IndexIVFFlat, IndexIVFPQ
 
 
 class AutoFaissIndex:
@@ -19,9 +19,9 @@ class AutoFaissIndex:
     Kelas pembungkus untuk pemilihan tipe indeks FAISS secara otomatis
 
     Secara otomatis memilih tipe indeks optimal berdasarkan jumlah data:
-    - Himpunan data kecil (<10 ribu): FlatL2 (pencarian presisi)
-    - Himpunan data sedang (10 ribu - 100 ribu): IVFFlat (pencarian perkiraan)
-    - Himpunan data besar (>100 ribu): IVFPQ (pencarian perkiraan efisiensi tinggi)
+    - Himpunan data kecil (<10 ribu): FlatIP (pencarian brute-force dengan inner-product/cosine)
+    - Himpunan data sedang (10 ribu - 100 ribu): IVFFlat (kuantisasi dengan quantizer inner-product)
+    - Himpunan data besar (>100 ribu): IVFPQ (kuantisasi produk dengan quantizer inner-product)
     """
 
     def __init__(self, dimension=384):
@@ -41,20 +41,23 @@ class AutoFaissIndex:
     def select_index_type(self, num_vectors):
         """Secara otomatis memilih tipe indeks optimal berdasarkan jumlah vektor"""
         if num_vectors <= self.small_dataset_threshold:
-            self.index_type = "FlatL2"
-            self.index = IndexFlatL2(self.dimension)
+            self.index_type = "FlatIP"
+            # Use inner-product index for cosine similarity when vectors are L2-normalized
+            self.index = IndexFlatIP(self.dimension)
             self.nprobe = 1
         elif num_vectors <= self.medium_dataset_threshold:
             self.index_type = "IVFFlat"
             self.nlist = min(100, int(np.sqrt(num_vectors)))
-            quantizer = IndexFlatL2(self.dimension)
+            # use IP quantizer to match inner-product search semantics
+            quantizer = IndexFlatIP(self.dimension)
             self.index = IndexIVFFlat(quantizer, self.dimension, self.nlist)
             self.nprobe = min(10, max(1, int(self.nlist * 0.1)))
         else:
             self.index_type = "IVFPQ"
             self.nlist = min(256, int(np.sqrt(num_vectors)))
             self.m = min(8, self.dimension // 4)
-            quantizer = IndexFlatL2(self.dimension)
+            # use IP quantizer for inner-product semantics
+            quantizer = IndexFlatIP(self.dimension)
             self.index = IndexIVFPQ(quantizer, self.dimension, self.nlist, self.m, 8)
             self.nprobe = min(32, max(1, int(self.nlist * 0.05)))
 
@@ -126,24 +129,25 @@ class VectorStore:
         Mencari vektor paling mirip
 
         Returns:
-            (docs, doc_ids, metadatas)
+            (docs, doc_ids, metadatas, distances)
         """
         if self.index is None or self.index.ntotal == 0:
-            return [], [], []
+            return [], [], [], []
         try:
             D, I = self.index.search(query_embedding, k=k)
-            docs, doc_ids, metadatas = [], [], []
-            for faiss_idx in I[0]:
+            docs, doc_ids, metadatas, distances = [], [], [], []
+            for faiss_idx, distance in zip(I[0], D[0]):
                 if faiss_idx != -1 and faiss_idx < len(self.id_order):
                     original_id = self.id_order[faiss_idx]
                     if original_id in self.contents_map:
                         docs.append(self.contents_map[original_id])
                         doc_ids.append(original_id)
                         metadatas.append(self.metadatas_map.get(original_id, {}))
-            return docs, doc_ids, metadatas
+                        distances.append(float(distance))
+            return docs, doc_ids, metadatas, distances
         except Exception as e:
             logging.error(f"Kesalahan pencarian FAISS: {str(e)}")
-            return [], [], []
+            return [], [], [], []
 
     @property
     def is_ready(self):

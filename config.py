@@ -43,15 +43,73 @@ OLLAMA_MODEL_NAME = os.getenv("OLLAMA_MODEL_NAME", "deepseek-r1:8b")
 SILICONFLOW_MODEL_NAME = os.getenv("SILICONFLOW_MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
 RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")
 
+# Konfigurasi Model Embedding
+# Pilihan provider: 'sentence_transformers' (offline lokal) atau 'ollama' (lokal menggunakan layanan Ollama)
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "sentence_transformers")
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Langkah 4: Hyperparameter RAG
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CHUNK_SIZE = 400          # Ukuran blok teks (jumlah karakter)
-CHUNK_OVERLAP = 40        # Jumlah karakter tumpang tindih antar blok yang berdekatan
+CHUNK_OVERLAP = 60        # Jumlah karakter tumpang tindih antar blok yang berdekatan
 HYBRID_ALPHA = 0.7        # Bobot pencarian semantik dalam pencarian hibrida (0-1)
-RETRIEVAL_TOP_K = 10      # Jumlah dokumen kandidat yang dikembalikan oleh pencarian
-RERANK_TOP_K = 5          # Jumlah dokumen yang dipertahankan setelah pengurutan ulang
-MAX_RETRIEVAL_ITERATIONS = 3  # Jumlah iterasi maksimum untuk pencarian rekursif
+RETRIEVAL_TOP_K = 15      # Jumlah dokumen kandidat yang dikembalikan oleh pencarian (factoid default)
+RERANK_TOP_K = 7          # Jumlah dokumen yang dipertahankan setelah pengurutan ulang (factoid default)
+MAX_RETRIEVAL_ITERATIONS = 1  # Jumlah iterasi maksimum untuk pencarian rekursif
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Dynamic Top-K per query type
+# factoid   : single-answer questions ("what year", "who is")
+# comparison: multi-entity questions ("compare X and Y", "difference between")
+# enumeration: exhaustive list questions ("list all", "apa saja", "sebutkan semua")
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FACTOID_RETRIEVAL_TOP_K = 15
+COMPARISON_RETRIEVAL_TOP_K = 25
+ENUMERATION_RETRIEVAL_TOP_K = 40
+
+FACTOID_RERANK_TOP_K = 7
+COMPARISON_RERANK_TOP_K = 15
+ENUMERATION_RERANK_TOP_K = 25
+
+# Keywords used to detect query type (extend as needed)
+ENUMERATION_SIGNALS = [
+    "list", "all", "every", "each", "enumerate",
+    "sebutkan", "semua", "apa saja", "daftarkan",
+    "berapa banyak", "which", "what are", "what were",
+    "how many",
+]
+COMPARISON_SIGNALS = [
+    "compare", "comparison", "difference", "vs", "versus",
+    "bandingkan", "perbedaan", "dibandingkan",
+]
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Ollama inference options
+# Applied to every /api/chat request. Shared across generation and rewrite calls,
+# except temperature which is overridden per call site.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+OLLAMA_OPTIONS_GENERATION = {
+    "temperature": 0.0,
+    "seed": 42,
+    "num_ctx": 8192,
+    "top_k": 20,
+    "top_p": 0.9,
+    "repeat_penalty": 1.1,
+}
+OLLAMA_OPTIONS_REWRITE = {
+    "temperature": 0.0,
+    "seed": 42,
+    "top_p": 0.9,
+    "top_k": 20,
+    "repeat_penalty": 1.1,
+    "num_ctx": 8192,    
+}
+
+# Page-level smart OCR fallback thresholds
+IMAGE_PLACEHOLDER_THRESHOLD = 8
+MIN_VISIBLE_RATIO = 0.20
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Langkah 5: Konfigurasi Lingkungan Runtime

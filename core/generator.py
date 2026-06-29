@@ -12,7 +12,8 @@ import logging
 import requests
 from config import (
     SILICONFLOW_API_KEY, SILICONFLOW_API_URL,
-    SILICONFLOW_MODEL_NAME, OLLAMA_MODEL_NAME
+    SILICONFLOW_MODEL_NAME, OLLAMA_MODEL_NAME,
+    OLLAMA_OPTIONS_GENERATION, OLLAMA_OPTIONS_REWRITE,
 )
 from utils.network import get_session
 from core.retriever import recursive_retrieval
@@ -62,50 +63,70 @@ def call_siliconflow_api(prompt, temperature=0.7, max_tokens=1024):
         return f"Terjadi kesalahan tidak diketahui: {str(e)}"
 
 
-def call_llm_simple(prompt, model_choice="siliconflow"):
-    """Panggilan LLM sederhana (digunakan untuk penentuan penulisan ulang kueri dalam pencarian rekursif)"""
+def call_llm_simple(prompt, model_choice="siliconflow", temperature=0.0):
+    """Panggilan LLM sederhana (digunakan untuk penentuan penulisan ulang kueri dalam pencarian rekursif)
+    Menyediakan parameter `temperature` agar pemanggilan deterministik ketika diperlukan.
+    """
     if model_choice == "siliconflow":
-        result = call_siliconflow_api(prompt)
+        result = call_siliconflow_api(prompt, temperature=temperature)
         result = result.strip() if isinstance(result, str) else result[0].strip()
         if "<think>" in result:
             result = result.split("<think>")[0].strip()
         return result
     else:
         response = get_session().post(
-            "http://localhost:11434/api/generate",
-            json={"model": OLLAMA_MODEL_NAME, "prompt": prompt, "stream": False},
+            "http://localhost:11434/api/chat",
+            json={
+                "model": OLLAMA_MODEL_NAME,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                "think": False,
+                "options": {**OLLAMA_OPTIONS_REWRITE, "temperature": temperature},
+            },
             timeout=180
         )
-        return response.json().get("response", "").strip()
+        response.raise_for_status()
+        return response.json().get("message", {}).get("content", "").strip()
 
 
 def _build_prompt(question, context, enable_web_search, knowledge_base_exists,
-                  time_sensitive, conflict_detected):
+                  time_sensitive, conflict_detected, query_type="factoid"):
     """Membangun prompt"""
-    prompt_template = """Sebagai asisten tanya jawab profesional, Anda perlu menjawab pertanyaan pengguna berdasarkan {context_type} berikut.
+    extra = ""
+    if time_sensitive and enable_web_search:
+        extra += " Prioritise the most recent information."
+    if conflict_detected:
+        extra += " Clearly highlight discrepancies between sources."
+    if query_type == "enumeration":
+        extra += (
+            " This is an enumeration question. You MUST scan every retrieved chunk and collect"
+            " ALL matching items without stopping early. Present your answer as a numbered list."
+            " If an item appears in multiple chunks, list it only once."
+        )
 
-Konten referensi yang disediakan:
-{context}
+    prompt_template = (
+        "You are a document Q&A assistant. Answer ONLY using the retrieved context below."
+        " Do not use any external knowledge."
+        " Answer in the same language as the question.{extra}\n"
+        "When the question asks for a list or categories, enumerate all relevant items found across all retrieved chunks.\n"
+        "If the context does not contain sufficient information, respond with exactly:\n"
+        "\"I cannot find this information in the provided documents.\"\n"
+        "Always cite the source label (e.g. [Document: filename | Section: heading]) "
+        "inline next to each claim.\n\n"
+        "[Retrieved Context]\n{context}\n\n"
+        "[Question]\n{question}\n\n"
+        "Answer:"
+    )
 
-Pertanyaan Pengguna: {question}
-
-Harap ikuti prinsip-prinsip jawaban berikut:
-1. Hanya jawab pertanyaan berdasarkan konten referensi yang disediakan, jangan gunakan pengetahuan Anda sendiri
-2. Jika konten referensi tidak berisi informasi yang cukup, harap beri tahu dengan jujur bahwa Anda tidak dapat menjawab
-3. Jawaban harus komprehensif, akurat, terstruktur, dan menggunakan paragraf serta struktur yang sesuai
-4. Harap berikan jawaban dalam Bahasa Indonesia, kecuali jika pengguna bertanya dalam Bahasa Inggris (dalam hal ini harap gunakan Bahasa Inggris)
-5. Tandai sumber informasi di akhir jawaban{time_instruction}{conflict_instruction}
-
-Silakan mulai menjawab sekarang:"""
+    resolved_context = context if context else (
+        "No web search results available." if enable_web_search and not knowledge_base_exists
+        else "No relevant context found in the provided documents."
+    )
 
     return prompt_template.format(
-        context_type="dokumen lokal dan hasil pencarian internet" if enable_web_search and knowledge_base_exists else (
-            "hasil pencarian internet" if enable_web_search else "dokumen lokal"),
-        context=context if context else (
-            "Hasil pencarian internet akan digunakan untuk menjawab." if enable_web_search and not knowledge_base_exists else "Basis pengetahuan kosong atau konten relevan tidak ditemukan."),
+        extra=extra,
+        context=resolved_context,
         question=question,
-        time_instruction=", prioritaskan penggunaan informasi terbaru" if time_sensitive and enable_web_search else "",
-        conflict_instruction=", dan tunjukkan dengan jelas perbedaan antara berbagai sumber" if conflict_detected else ""
     )
 
 
@@ -126,8 +147,30 @@ def _build_context(all_contexts, all_doc_ids, all_metadata, enable_web_search):
             source_item['title'] = title
         else:
             source = metadata.get('source', 'Sumber tidak diketahui')
-            context_parts.append(f"[Dokumen Lokal: {source}]\n{doc}")
+            section = metadata.get('section')
+            subsection = metadata.get('subsection')
+            heading = metadata.get('heading')
+            chunk_index = metadata.get('chunk_index')
+            source_label = f"[Dokumen Lokal: {source}"
+            if section:
+                source_label += f" | Section: {section}"
+            if subsection:
+                source_label += f" | Subsection: {subsection}"
+            if heading:
+                source_label += f" | Heading: {heading}"
+            if chunk_index is not None:
+                source_label += f" | Chunk #{chunk_index + 1}"
+            source_label += "]"
+            context_parts.append(f"{source_label}\n{doc}")
             source_item['source'] = source
+            if section:
+                source_item['section'] = section
+            if subsection:
+                source_item['subsection'] = subsection
+            if heading:
+                source_item['heading'] = heading
+            if chunk_index is not None:
+                source_item['chunk_index'] = chunk_index
 
         sources_for_conflict.append(source_item)
 
@@ -148,7 +191,7 @@ def query_answer(question, enable_web_search=False, model_choice="siliconflow", 
         if progress:
             progress(0.3, desc="Menjalankan pencarian rekursif...")
 
-        all_contexts, all_doc_ids, all_metadata = recursive_retrieval(
+        all_contexts, all_doc_ids, all_metadata, query_type = recursive_retrieval(
             initial_query=question, enable_web_search=enable_web_search, model_choice=model_choice
         )
 
@@ -157,7 +200,7 @@ def query_answer(question, enable_web_search=False, model_choice="siliconflow", 
         time_sensitive = any(w in question.lower() for w in ["terbaru", "tahun ini", "saat ini", "baru-baru ini", "baru saja"])
 
         prompt = _build_prompt(question, context, enable_web_search,
-                               knowledge_base_exists, time_sensitive, conflict_detected)
+                               knowledge_base_exists, time_sensitive, conflict_detected, query_type)
 
         if progress:
             progress(0.8, desc="Menghasilkan jawaban...")
@@ -166,12 +209,19 @@ def query_answer(question, enable_web_search=False, model_choice="siliconflow", 
             result = call_siliconflow_api(prompt, temperature=0.7, max_tokens=1536)
         else:
             response = get_session().post(
-                "http://localhost:11434/api/generate",
-                json={"model": OLLAMA_MODEL_NAME, "prompt": prompt, "stream": False},
-                timeout=180, headers={'Connection': 'close'}
+                "http://localhost:11434/api/chat",
+                json={
+                    "model": OLLAMA_MODEL_NAME,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "think": False,
+                    "options": OLLAMA_OPTIONS_GENERATION,
+                },
+                timeout=180,
+                headers={'Connection': 'close'}
             )
             response.raise_for_status()
-            result = str(response.json().get("response", "Gagal mendapatkan jawaban yang valid"))
+            result = response.json().get("message", {}).get("content", "Gagal mendapatkan jawaban yang valid")
 
         return process_thinking_content(result)
 
@@ -192,7 +242,7 @@ def stream_answer(question, enable_web_search=False, model_choice="siliconflow",
         if progress:
             progress(0.3, desc="Menjalankan pencarian rekursif...")
 
-        all_contexts, all_doc_ids, all_metadata = recursive_retrieval(
+        all_contexts, all_doc_ids, all_metadata, query_type = recursive_retrieval(
             initial_query=question, enable_web_search=enable_web_search, model_choice=model_choice
         )
 
@@ -201,26 +251,31 @@ def stream_answer(question, enable_web_search=False, model_choice="siliconflow",
         time_sensitive = any(w in question.lower() for w in ["terbaru", "tahun ini", "saat ini", "baru-baru ini", "baru saja"])
 
         prompt = _build_prompt(question, context, enable_web_search,
-                               knowledge_base_exists, time_sensitive, conflict_detected)
+                               knowledge_base_exists, time_sensitive, conflict_detected, query_type)
 
         if model_choice == "siliconflow":
             full_answer = call_siliconflow_api(prompt, temperature=0.7, max_tokens=1536)
             yield process_thinking_content(full_answer), "Selesai!"
         else:
             response = get_session().post(
-                "http://localhost:11434/api/generate",
-                json={"model": OLLAMA_MODEL_NAME, "prompt": prompt, "stream": True},
-                timeout=120, stream=True
+                "http://localhost:11434/api/chat",
+                json={
+                    "model": OLLAMA_MODEL_NAME,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": True,
+                    "think": False,
+                    "options": OLLAMA_OPTIONS_GENERATION,
+                },
+                timeout=120,
+                stream=True
             )
             full_answer = ""
             for line in response.iter_lines():
                 if line:
-                    chunk = json.loads(line.decode()).get("response", "")
+                    data = json.loads(line.decode())
+                    chunk = data.get("message", {}).get("content", "")
                     full_answer += chunk
-                    if "<think>" in full_answer and "</think>" in full_answer:
-                        yield process_thinking_content(full_answer), "Menghasilkan jawaban..."
-                    else:
-                        yield full_answer, "Menghasilkan jawaban..."
+                    yield full_answer, "Menghasilkan jawaban..."
 
             yield process_thinking_content(full_answer), "Selesai!"
 
